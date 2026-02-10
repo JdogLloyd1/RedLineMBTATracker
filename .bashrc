@@ -9,9 +9,8 @@
 # alias lms='/c/Users/tmf77/.lmstudio/bin/lms.exe'
 
 # Add Ollama to PATH for this project
-# Commenting 1.25.26 because I don't have it installed
-# export PATH="$PATH:/c/Users/tmf77/AppData/Local/Programs/Ollama"
-# alias ollama='/c/Users/tmf77/AppData/Local/Programs/Ollama/ollama.exe'
+export PATH="$PATH:/c/Users/jonyl/AppData/Local/Programs/Ollama"
+alias ollama='/c/Users/jonyl/AppData/Local/Programs/Ollama/ollama.exe'
 
 # Add R to your Path for this project 
 export PATH="$PATH:/c/Program\ Files/R/R-4.5.2/bin"
