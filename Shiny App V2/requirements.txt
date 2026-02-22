@@ -1,0 +1,11 @@
+# Shiny App V2 – MBTA Red Line Tracker with AI Commuter Report
+# Install: pip install -r requirements.txt
+
+shiny>=1.0.0
+pandas>=2.0.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+plotly>=5.18.0
+shinywidgets>=0.3.0
+polyline>=2.0.0
+python-docx>=1.0.0

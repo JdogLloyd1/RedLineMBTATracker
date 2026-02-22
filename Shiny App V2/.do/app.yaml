@@ -1,0 +1,19 @@
+# DigitalOcean App Platform spec for Shiny App V2
+# Deploy from repo: use "Deploy from Dockerfile" and set Source Directory to "Shiny App V2"
+# so the build context is this folder. Set MBTA_API_KEY and OLLAMA_API_KEY as secrets.
+
+name: red-line-mbta-tracker-v2
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    github:
+      repo: JdogLloyd1/RedLineMBTATracker
+      branch: main
+      deploy_on_push: true
+    envs:
+      - key: MBTA_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: OLLAMA_API_KEY
+        scope: RUN_TIME
+        type: SECRET
