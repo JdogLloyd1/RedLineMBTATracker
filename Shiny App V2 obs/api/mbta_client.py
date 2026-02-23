@@ -13,7 +13,9 @@ from dotenv import load_dotenv
 ## 0.1 Load environment #####################################################
 
 _app_dir = Path(__file__).resolve().parent.parent
-_env_paths = [_app_dir / ".env", _app_dir.parent / ".env"]
+_repo_root = _app_dir.parent
+# Prefer repo-level .env so one shared file works from any run context
+_env_paths = [_repo_root / ".env", _app_dir / ".env"]
 for _p in _env_paths:
     if _p.exists():
         load_dotenv(_p)

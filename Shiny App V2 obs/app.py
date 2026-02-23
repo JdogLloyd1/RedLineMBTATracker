@@ -6,14 +6,27 @@
 
 import asyncio
 import concurrent.futures
+import json
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 EASTERN = ZoneInfo("America/New_York")
 
+# #region agent log
+def _dbg_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
+    try:
+        log_path = Path(__file__).resolve().parent.parent / "debug-ce9241.log"
+        payload = {"sessionId": "ce9241", "location": location, "message": message, "data": data, "timestamp": int(datetime.now(EASTERN).timestamp() * 1000)}
+        if hypothesis_id:
+            payload["hypothesisId"] = hypothesis_id
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+# #endregion
+
 from shiny import App, reactive, render, ui
-from shiny.types import SilentException
 import pandas as pd
 import plotly.graph_objects as go
 from shinywidgets import output_widget, render_widget
@@ -78,11 +91,13 @@ vehicles_map = reactive.value([])
 shapes_by_route = reactive.value({})
 last_api_call_time = reactive.value(None)
 skip_next_timer_refresh = reactive.value(False)
-# AI report: text and error
+# AI report: text, error, last saved docx filename
 ai_report_text = reactive.value("")
 ai_report_error = reactive.value("")
+ai_report_docx_saved = reactive.value(None)
 
 MIN_AUTO_REFRESH_MINUTES = 0.5
+MAX_DEBUG_LINES = 50
 
 # 2. UI #####################################################################
 
@@ -100,7 +115,12 @@ def make_sidebar():
         ui.hr(),
         ui.input_action_button("run_ai_report", "Run AI Commuter Report", class_="btn-success"),
         ui.p(
-            "Generates a summary report via Ollama Cloud and saves .docx to reports/.",
+            "Generates a summary report via Ollama Cloud.",
+            class_="text-muted small",
+        ),
+        ui.input_action_button("save_docx", "Save as .docx", class_="btn btn-outline-primary"),
+        ui.p(
+            "Export the current report to reports/ (only enabled after generating a report).",
             class_="text-muted small",
         ),
         ui.hr(),
@@ -174,6 +194,13 @@ def app_ui(request):
                 class_="text-muted mb-3",
             ),
             ui.output_ui("split_layout"),
+            ui.hr(),
+            ui.div(
+                ui.h6("Debug log", class_="text-muted"),
+                ui.input_action_button("debug_clear", "Clear debug log", class_="btn btn-sm btn-outline-secondary mb-2"),
+                ui.output_ui("debug_log_ui"),
+                class_="mt-3 p-2 border rounded",
+            ),
             class_="p-3",
         ),
         title="Red Line Tracker V2",
@@ -201,11 +228,17 @@ def _do_refresh_sync(dep_stop: str) -> dict:
     elif shapes_resp.get("error"):
         err = shapes_resp.get("message", "API error")
     if err:
+        # #region agent log
+        _dbg_log("app.py:_do_refresh_sync", "sync refresh error", {"error": err[:80]}, "H4")
+        # #endregion
         return {"error": err}
     predictions_all_resp = fetch_predictions_all_stops()
     if predictions_all_resp.get("error"):
         predictions_all_resp = None
     red_shapes = parse_red_line_shape(shapes_resp)
+    # #region agent log
+    _dbg_log("app.py:_do_refresh_sync", "sync refresh completed", {"has_error": False}, "H4")
+    # #endregion
     return {
         "error": None,
         "df_alerts": parse_alerts(alerts_resp),
@@ -219,7 +252,7 @@ def _do_refresh_sync(dep_stop: str) -> dict:
 
 
 def _run_ai_report_sync(dep_stop: str, arr_stop: str, dep_name: str, arr_name: str) -> dict:
-    """Fetch, format, query Ollama, write docx. Returns dict with report or error."""
+    """Fetch, format, query Ollama. Returns dict with report or error. Does NOT write docx."""
     try:
         alerts_resp = fetch_alerts()
         pred_dep_resp = fetch_predictions_at_stop(dep_stop)
@@ -243,25 +276,77 @@ def _run_ai_report_sync(dep_stop: str, arr_stop: str, dep_name: str, arr_name: s
         prompt = get_report_prompt(dep_name, arr_name)
         user_content = prompt.strip() + "\n\n---\nData:\n" + formatted
         report = query_ollama_cloud(user_content)
-        reports_dir = Path(__file__).resolve().parent / "reports"
-        out_path = write_report_docx(report, output_dir=reports_dir)
-        return {"report": report, "saved_to": out_path.name}
+        return {"report": report}
     except Exception as e:
         return {"error": str(e)}
+
+
+def _fetch_map_layers_sync(route_names: list) -> dict:
+    """Fetch shapes for given route names. Returns dict name -> list of (lons, lats). Runs in thread."""
+    out = {}
+    for name in route_names or []:
+        if name not in MAP_ROUTE_IDS:
+            continue
+        ids = MAP_ROUTE_IDS[name]
+        all_geoms = []
+        for rid in ids:
+            resp = fetch_shapes(rid) if rid else None
+            if resp and not resp.get("error"):
+                all_geoms.extend(parse_red_line_shape(resp))
+        if all_geoms:
+            out[name] = all_geoms
+    return out
 
 
 # 3. Server ##################################################################
 
 
 def server(input, output, session):
+    # Session-scoped debug log so updates invalidate this session's outputs
+    debug_log = reactive.value([])
+
+    def _debug_append(msg: str) -> None:
+        ts = datetime.now(EASTERN).strftime("%H:%M:%S")
+        lines = list(debug_log())
+        lines.append(f"[{ts}] {msg}")
+        if len(lines) > MAX_DEBUG_LINES:
+            lines = lines[-MAX_DEBUG_LINES:]
+        debug_log.set(lines)
+
+    # Explicit reactive calcs for sidebar inputs so UI and debug log reliably
+    # invalidate when they change (avoids dependency-tracking issues with raw input reads).
+    @reactive.calc
+    def _layout_inputs():
+        ratio = input.panel_ratio()
+        height = input.map_height()
+        return (ratio if ratio is not None else 55, height if height is not None else 700)
+
+    @reactive.calc
+    def _map_routes_selected():
+        return list(input.map_routes() or ["Red"])
+
+    _last_logged_layout = reactive.value(None)
+
+    @reactive.effect
+    def _log_layout_input_changes():
+        layout = _layout_inputs()
+        # #region agent log
+        ratio, height = layout
+        _dbg_log("app.py:_log_layout_input_changes", "layout inputs", {"ratio": ratio, "height": height}, "H5")
+        # #endregion
+        if layout != _last_logged_layout():
+            _last_logged_layout.set(layout)
+            ratio, height = layout
+            _debug_append(f"Sidebar: panel_ratio={ratio}%, map_height={height}px")
+
     @reactive.extended_task
     async def refresh_task(dep_stop: str):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_executor, _do_refresh_sync, dep_stop)
 
     @reactive.extended_task
     async def ai_report_task(dep_stop: str, arr_stop: str, dep_name: str, arr_name: str):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             _executor,
             _run_ai_report_sync,
@@ -271,28 +356,63 @@ def server(input, output, session):
             arr_name,
         )
 
+    @reactive.extended_task
+    async def fetch_map_layers_task(route_names: list):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_executor, _fetch_map_layers_sync, route_names)
+
+    def _cancel_background_tasks():
+        """Cancel extended tasks on session end so the app can close without waiting."""
+        for task in (refresh_task, ai_report_task, fetch_map_layers_task):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+
+    session.on_ended(_cancel_background_tasks)
+
     @reactive.effect
-    @reactive.event(input.refresh, ignore_none=False)
+    @reactive.event(input.refresh)
     def _on_refresh_clicked():
-        skip_next_timer_refresh.set(True)
+        # #region agent log
         dep = input.dep_station() or "place-alfcl"
+        _dbg_log("app.py:_on_refresh_clicked", "Run API query button fired", {"dep": dep}, "H3")
+        # #endregion
+        _debug_append(f"Run API query clicked, dep={dep}")
+        skip_next_timer_refresh.set(True)
         ui.notification_show("Fetching data...", duration=2, type="message")
-        refresh_task(dep)
+        refresh_task.invoke(dep)
 
     @reactive.effect
     def _apply_refresh_result():
+        status = refresh_task.status()
+        # #region agent log
+        _dbg_log("app.py:_apply_refresh_result", "effect run", {"status": status, "will_apply": status in ("success", "error")}, "H1_H4")
+        # #endregion
+        if status not in ("success", "error"):
+            # Re-check after 2s so we don't starve the reactive loop (0.25s was blocking other events).
+            if status == "running":
+                reactive.invalidate_later(2.0)
+            return
         try:
             result = refresh_task.result()
-        except SilentException:
-            raise
         except Exception as e:
+            # #region agent log
+            _dbg_log("app.py:_apply_refresh_result", "result() exception", {"exc": str(e)[:100]}, "H8")
+            # #endregion
             api_error.set(str(e))
+            _debug_append(f"Refresh result: exception — {e}")
             return
         if not isinstance(result, dict):
             return
         if result.get("error"):
             api_error.set(result["error"])
+            _debug_append(f"Refresh result: error — {result['error'][:80]}")
             return
+        # #region agent log
+        _dbg_log("app.py:_apply_refresh_result", "applying result", {"keys": list(result.keys())}, "H8")
+        # #endregion
+        _debug_append("Refresh result: success")
         api_error.set(None)
         df_alerts.set(result.get("df_alerts", pd.DataFrame()))
         df_departures.set(result.get("df_departures", pd.DataFrame()))
@@ -307,44 +427,59 @@ def server(input, output, session):
         last_api_call_time.set(result.get("last_api_call_time"))
 
     @reactive.effect
-    @reactive.event(input.run_ai_report, ignore_none=False)
+    @reactive.event(input.run_ai_report)
     def _on_ai_report_clicked():
         dep = input.dep_station() or "place-alfcl"
         arr = input.arr_station() or "place-cntsq"
         dep_name = get_station_name(dep)
         arr_name = get_station_name(arr)
+        # #region agent log
+        _dbg_log("app.py:_on_ai_report_clicked", "Run AI report button fired", {"dep": dep_name, "arr": arr_name}, "H3")
+        # #endregion
+        _debug_append(f"Run AI report clicked: {dep_name} → {arr_name}")
         ai_report_error.set("")
+        ai_report_docx_saved.set(None)
         ai_report_text.set("Generating report...")
         ui.notification_show("Generating AI report...", duration=3, type="message")
-        ai_report_task(dep, arr, dep_name, arr_name)
+        ai_report_task.invoke(dep, arr, dep_name, arr_name)
 
     @reactive.effect
     def _apply_ai_report_result():
+        # Only read result when task has completed; avoids SilentException spinner
+        status = ai_report_task.status()
+        # #region agent log
+        _dbg_log("app.py:_apply_ai_report_result", "effect run", {"status": status, "will_apply": status in ("success", "error")}, "H4")
+        # #endregion
+        if status not in ("success", "error"):
+            if status == "running":
+                reactive.invalidate_later(2.0)
+            return
         try:
             result = ai_report_task.result()
-        except SilentException:
-            raise
         except Exception as e:
             ai_report_error.set(str(e))
             ai_report_text.set("")
+            _debug_append(f"AI report result: exception — {e}")
             return
         if not isinstance(result, dict):
             return
         if result.get("error"):
             ai_report_error.set(result["error"])
             ai_report_text.set("")
+            _debug_append(f"AI report result: error — {result['error'][:80]}")
             return
         report = result.get("report", "")
-        saved = result.get("saved_to", "")
-        if saved:
-            ai_report_text.set(report + f"\n\n---\n*Saved to: {saved}*")
-        else:
-            ai_report_text.set(report)
+        ai_report_text.set(report)
+        _debug_append("AI report result: success")
 
     @reactive.effect
     def _auto_refresh_timer():
-        input.refresh()
+        # Do not read input.refresh() here — it made this effect run on every button click
+        # and could contribute to blocking the reactive loop.
         interval_min = input.refresh_interval_min()
+        # #region agent log
+        _dbg_log("app.py:_auto_refresh_timer", "effect run", {"interval_min": interval_min, "skip": skip_next_timer_refresh()}, "H1_H2")
+        # #endregion
         if interval_min is None or interval_min <= 0:
             return
         delay_sec = max(float(interval_min), MIN_AUTO_REFRESH_MINUTES) * 60
@@ -353,50 +488,83 @@ def server(input, output, session):
             reactive.invalidate_later(delay_sec)
             return
         dep = input.dep_station() or "place-alfcl"
-        refresh_task(dep)
+        refresh_task.invoke(dep)
         reactive.invalidate_later(delay_sec)
 
     @reactive.effect
-    def _fetch_extra_map_layers():
-        selected = list(input.map_routes() or [])
+    @reactive.event(input.save_docx)
+    def _on_save_docx_clicked():
+        _debug_append("Save as .docx clicked")
+        txt = ai_report_text()
+        if not txt or txt == "Generating report...":
+            _debug_append("Save docx: skipped (no report)")
+            return
+        try:
+            reports_dir = Path(__file__).resolve().parent / "reports"
+            out_path = write_report_docx(txt, output_dir=reports_dir)
+            ai_report_docx_saved.set(out_path.name)
+            _debug_append(f"Save docx: saved {out_path.name}")
+            ui.notification_show(f"Saved to {out_path.name}", duration=3, type="message")
+        except Exception as e:
+            _debug_append(f"Save docx: error — {e}")
+            ui.notification_show(f"Error saving: {e}", duration=5, type="error")
+
+    @reactive.effect
+    @reactive.event(input.debug_clear)
+    def _on_debug_clear():
+        debug_log.set([])
+
+    @reactive.effect
+    def _trigger_fetch_map_layers():
+        selected = _map_routes_selected()
         cache = dict(shapes_by_route())
         to_fetch = [r for r in selected if r not in cache and r in MAP_ROUTE_IDS]
         if not to_fetch:
             return
-        for name in to_fetch:
-            ids = MAP_ROUTE_IDS[name]
-            all_geoms = []
-            for rid in ids:
-                resp = fetch_shapes(rid) if rid else None
-                if resp and not resp.get("error"):
-                    all_geoms.extend(parse_red_line_shape(resp))
-            if all_geoms:
-                cache[name] = all_geoms
-        shapes_by_route.set(cache)
+        fetch_map_layers_task.invoke(to_fetch)
+
+    @reactive.effect
+    def _apply_map_layers_result():
+        status = fetch_map_layers_task.status()
+        if status not in ("success", "error"):
+            return
+        try:
+            result = fetch_map_layers_task.result()
+        except Exception:
+            return
+        if not isinstance(result, dict) or not result:
+            return
+        current = dict(shapes_by_route())
+        for name, geoms in result.items():
+            if geoms:
+                current[name] = geoms
+        shapes_by_route.set(current)
 
     @render.ui
     def split_layout():
         """Split layout: left (tabs), right (report). Width from panel_ratio slider."""
-        ratio = input.panel_ratio()
-        if ratio is None:
-            ratio = 55
+        ratio, _ = _layout_inputs()
         left_w = max(4, min(8, int(12 * ratio / 100)))
         right_w = 12 - left_w
         report_txt = ai_report_text()
         report_err = ai_report_error()
+        docx_saved = ai_report_docx_saved()
         if report_err:
             report_content = ui.div(
                 ui.div(ui.strong("Error: "), report_err, class_="alert alert-danger", role="alert"),
             )
         elif report_txt:
-            report_content = ui.div(
+            parts = [
                 ui.h4("AI Commuter Report", class_="mb-2"),
                 ui.div(
                     ui.markdown(report_txt),
                     class_="p-3 bg-light rounded",
                     style="max-height: 500px; overflow-y: auto;",
                 ),
-            )
+            ]
+            if docx_saved:
+                parts.insert(1, ui.p("Saved to: " + docx_saved, class_="text-success small mb-2"))
+            report_content = ui.div(*parts)
         else:
             report_content = ui.div(
                 ui.h4("AI Commuter Report", class_="mb-2"),
@@ -439,6 +607,23 @@ def server(input, output, session):
             class_="text-muted small",
         )
 
+    @render.ui
+    def debug_log_ui():
+        ratio, height = _layout_inputs()
+        lines = debug_log()
+        header = ui.p(
+            f"Panel ratio: {ratio}% | Map height: {height}px (sliders should update this line)",
+            class_="small text-muted mb-2",
+        )
+        if not lines:
+            return ui.div(header, ui.p("(no events yet — click Run API query or Run AI report)", class_="text-muted small"))
+        text = "\n".join(lines)
+        return ui.div(
+            header,
+            ui.pre(text, class_="small mb-0", style="white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; font-size: 11px;"),
+            class_="bg-dark text-light rounded p-2",
+        )
+
     def _format_df_for_display(df, datetime_cols=None):
         datetime_cols = datetime_cols or []
         out = df.copy()
@@ -451,9 +636,42 @@ def server(input, output, session):
                 )
         return out
 
+    def _refresh_data():
+        """Read refresh task result so outputs invalidate when task completes. Returns (df_alerts, df_departures, df_near_term, df_future) or (empty, empty, empty, empty)."""
+        status = refresh_task.status()
+        if status not in ("success", "error"):
+            return (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+            )
+        try:
+            res = refresh_task.result()
+        except Exception:
+            return (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+            )
+        if not isinstance(res, dict) or res.get("error"):
+            return (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+            )
+        return (
+            res.get("df_alerts", pd.DataFrame()),
+            res.get("df_departures", pd.DataFrame()),
+            res.get("df_near_term", pd.DataFrame()),
+            res.get("df_future", pd.DataFrame()),
+        )
+
     @render.data_frame
     def alerts_table():
-        df = df_alerts()
+        df, _, _, _ = _refresh_data()
         if df.empty:
             return render.DataGrid(pd.DataFrame(), width="100%", height="400px")
         return render.DataGrid(
@@ -464,7 +682,7 @@ def server(input, output, session):
 
     @render.data_frame
     def departures_table():
-        df = df_departures()
+        _, df, _, _ = _refresh_data()
         if df.empty:
             return render.DataGrid(pd.DataFrame(), width="100%", height="400px")
         return render.DataGrid(
@@ -478,7 +696,7 @@ def server(input, output, session):
 
     @render.data_frame
     def near_term_table():
-        df = df_near_term()
+        _, _, df, _ = _refresh_data()
         if df.empty:
             return render.DataGrid(pd.DataFrame(), width="100%", height="400px")
         return render.DataGrid(
@@ -492,7 +710,7 @@ def server(input, output, session):
 
     @render.data_frame
     def future_table():
-        df = df_future()
+        _, _, _, df = _refresh_data()
         if df.empty:
             return render.DataGrid(pd.DataFrame(), width="100%", height="400px")
         return render.DataGrid(
@@ -506,13 +724,22 @@ def server(input, output, session):
 
     @render_widget
     def map_widget():
-        height = input.map_height()
-        if height is None or height < 400:
-            height = 700
+        _, height = _layout_inputs()
         height = min(900, max(400, int(height)))
-        vehicles = vehicles_map()
-        cache = shapes_by_route()
-        selected = list(input.map_routes() or ["Red"])
+        cache = dict(shapes_by_route())
+        vehicles = list(vehicles_map())
+        # Read from refresh task so map invalidates when API result arrives
+        status = refresh_task.status()
+        if status in ("success", "error"):
+            try:
+                res = refresh_task.result()
+                if isinstance(res, dict) and not res.get("error"):
+                    vehicles = res.get("vehicles_map", []) or vehicles
+                    if res.get("red_shapes"):
+                        cache["Red"] = res["red_shapes"]
+            except Exception:
+                pass
+        selected = _map_routes_selected()
         center_lat = 42.373
         center_lon = -71.118
         fig = go.Figure()
@@ -611,7 +838,16 @@ def server(input, output, session):
 # 4. Run ####################################################################
 
 app = App(app_ui, server)
-app.on_shutdown(_executor.shutdown)
+
+# Background tasks that can block exit if not cleaned up:
+# 1. ThreadPoolExecutor (_executor) – runs refresh_task, ai_report_task, fetch_map_layers_task
+# 2. reactive.invalidate_later() – scheduled by _auto_refresh_timer when auto-refresh is on
+# 3. Extended tasks (refresh_task, ai_report_task, fetch_map_layers_task) – cancelled in session.on_ended
+def _on_shutdown():
+    """Shut down thread pool without blocking on in-flight tasks (avoids Ctrl+C hang)."""
+    _executor.shutdown(wait=False)
+
+app.on_shutdown(_on_shutdown)
 
 if __name__ == "__main__":
     from shiny import run_app

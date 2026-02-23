@@ -11,6 +11,9 @@ import requests
 import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+EASTERN = ZoneInfo("America/New_York")
 
 from dotenv import load_dotenv
 from docx import Document
@@ -18,7 +21,9 @@ from docx import Document
 ## 0.1 Load environment #####################################################
 
 _app_dir = Path(__file__).resolve().parent.parent
-_env_paths = [_app_dir / ".env", _app_dir.parent / ".env"]
+_repo_root = _app_dir.parent
+# Prefer repo-level .env so one shared file works from any run context
+_env_paths = [_repo_root / ".env", _app_dir / ".env"]
 for _p in _env_paths:
     if _p.exists():
         load_dotenv(_p)
@@ -41,15 +46,17 @@ def get_report_prompt(departure_station_name: str, arrival_station_name: str) ->
     return f"""Create a morning commute report for the Boston MBTA Red Line based on the JSON data below.
 
 **Section order (follow exactly):**
-1. Service Alerts – bullet points only; use station names from the data; do not invent stops.
-2. Train Rollup Table – outbound trains from {departure_station_name}.
-3. Brief summary – estimated time to {arrival_station_name} if available.
+1. Quick Takeaway – one or two sentences at the top with the essential summary (e.g., delays, on-time status, key alert).
+2. Service Alerts – bullet points only; use station names from the data; do not invent stops.
+3. Train Rollup Table – outbound trains from {departure_station_name}.
+4. Brief summary – estimated time to {arrival_station_name} if available.
 
 **Table format** (markdown table with these columns in this order):
 | Train ID | Destination | Scheduled Departure | Estimated Departure | On Time Status | Est. Time to {arrival_station_name} |
 
 **Constraints:**
 - Maximum half page.
+- Put the Quick Takeaway at the very top.
 - Friendly, conversational tone.
 - Use station names from the data only; do not invent stops."""
 
@@ -359,12 +366,13 @@ def write_report_docx(
         output_dir = _app_dir / "reports"
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc)
+    # Use UTC then convert to Eastern (avoids Windows locale/TZ env issues)
+    ts = datetime.now(timezone.utc).astimezone(EASTERN)
     fname = f"MBTA Red Line Commuter Report {ts.strftime('%Y.%m.%d')}_{ts.strftime('%H%M')}.docx"
     output_path = output_dir / fname
     doc = Document()
     doc.add_heading("MBTA Red Line – Morning Commute Overview", level=0)
-    doc.add_paragraph(ts.strftime("%Y-%m-%d %H:%M UTC"))
+    doc.add_paragraph(ts.strftime("%Y-%m-%d %H:%M %Z"))
     doc.add_paragraph()
     blocks = _report_blocks(report_text)
     for kind, content in blocks:
